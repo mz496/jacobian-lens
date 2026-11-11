@@ -104,7 +104,7 @@ EXAMPLES: list[Example] = [
         description="A two-hop factual question: which country, then which currency.",
         prompt=(
             "Fact: The capital of Japan is Tokyo.\n"
-            "Fact: The currency used in the country shaped like a boot is"
+            "Fact: The currency used in the country shaped like a boot is the"
         ),
     ),
     Example(
