@@ -71,8 +71,8 @@ def _load_model(model_name: str):
 
 
 @app.function(**function_kwargs)
-def apply(model_name: str, prompt: str, example_slug: str) -> tuple[str, str]:
-    """Walkthrough sections 1-4: readout at the second-to-last position + an embedded slice page."""
+def apply(model_name: str, example_slug: str) -> tuple[str, str]:
+    """Walkthrough sections 1-4: readout at the second-to-last position + an embedded slice page, both of the example's prompt."""
     import gzip
     import json
 
@@ -81,6 +81,8 @@ def apply(model_name: str, prompt: str, example_slug: str) -> tuple[str, str]:
     from jlens.vis import build_page, compute_slice
 
     model, tokenizer = _load_model(model_name)
+    example = next(e for e in EXAMPLES if e.slug == example_slug)
+    prompt = resolve_prompt(example, tokenizer)
     lens = jlens.JacobianLens.from_pretrained(LENS_REPO, filename=LENS_FILE[model_name], revision=LENS_REVISION)
 
     layers = [model.n_layers // 4, model.n_layers // 2, model.n_layers // 4 * 3, model.n_layers - 2]
@@ -97,11 +99,10 @@ def apply(model_name: str, prompt: str, example_slug: str) -> tuple[str, str]:
     lines.append(f"model:           {top5(model_logits[0])}")
 
     gloss = {int(k): v for k, v in json.load(gzip.open("/root/assets/qwen_gloss.json.gz")).items()}
-    example = next(e for e in EXAMPLES if e.slug == example_slug)
-    slice_data = compute_slice(model, lens, resolve_prompt(example, tokenizer), layer_stride=2, mask_display=True)
+    slice_data = compute_slice(model, lens, prompt, layer_stride=2, mask_display=True)
     page, _, _ = build_page(
         slice_data,
-        resolve_prompt(example, tokenizer),
+        prompt,
         title=example.section,
         description=example.description,
         alt_token=gloss,
@@ -139,14 +140,13 @@ def fit(model_name: str, n_prompts: int, dim_batch: int, checkpoint_every: int) 
 def main(
     mode: str = "apply",
     model: str = "Qwen/Qwen3.5-4B",
-    prompt: str = "Fact: The currency used in the country shaped like a boot is",
     example: str = "multihop",
     n_prompts: int = 100,
     dim_batch: int = 32,
     checkpoint_every: int = 10,
 ) -> None:
     if mode == "apply":
-        text, page = apply.remote(model, prompt, example)
+        text, page = apply.remote(model, example)
         print(text)
         Path("slice.html").write_text(page)
         print("wrote slice.html")
