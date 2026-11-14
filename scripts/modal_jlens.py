@@ -12,7 +12,7 @@ downloads) and fitted lenses at lenses/<model-slug>/jacobian_lens_n<N>.pt. To us
 
     uv run --with modal modal volume get jlens lenses/<model-slug>/jacobian_lens_n100.pt lenses/
 
-Optionally create a secret named "huggingface" containing HF_TOKEN for faster, rate-limit-free downloads:
+Needs a Modal secret named "huggingface" containing HF_TOKEN (the run fails if it is missing):
 
     uv run --with modal modal secret create huggingface HF_TOKEN=...
 """
@@ -55,7 +55,7 @@ function_kwargs = dict(
     gpu=GPU,
     timeout=60 * 60,
     volumes={VOL: volume},
-    secrets=[modal.Secret.from_name("huggingface")] if os.environ.get("MODAL_HF_SECRET") else [],
+    secrets=[modal.Secret.from_name("huggingface")],
 )
 
 
@@ -67,12 +67,15 @@ def _load_model(model_name: str):
 
     hf_model = transformers.AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16).cuda()
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
-    return jlens.from_hf(hf_model, tokenizer), tokenizer
+    return jlens.from_hf(hf_model, tokenizer), hf_model, tokenizer
 
 
 @app.function(**function_kwargs)
-def apply(model_name: str, example_slug: str) -> tuple[str, str]:
-    """Walkthrough sections 1-4: readout at the second-to-last position + an embedded slice page, both of the example's prompt."""
+def apply(model_name: str, example_slug: str, position: int, max_new_tokens: int) -> tuple[str, str]:
+    """Walkthrough sections 1-4: readout at `position` + an embedded slice page, both of the example's prompt.
+
+    With max_new_tokens > 0 the model also continues the prompt (greedy), e.g. past an assistant prefill; the
+    continuation is printed and the slice page covers prompt + continuation."""
     import gzip
     import json
 
@@ -80,14 +83,14 @@ def apply(model_name: str, example_slug: str) -> tuple[str, str]:
     from jlens.examples import EXAMPLES, resolve_prompt
     from jlens.vis import build_page, compute_slice
 
-    model, tokenizer = _load_model(model_name)
+    model, hf_model, tokenizer = _load_model(model_name)
     example = next(e for e in EXAMPLES if e.slug == example_slug)
     prompt = resolve_prompt(example, tokenizer)
     lens = jlens.JacobianLens.from_pretrained(LENS_REPO, filename=LENS_FILE[model_name], revision=LENS_REVISION)
 
     layers = [model.n_layers // 4, model.n_layers // 2, model.n_layers // 4 * 3, model.n_layers - 2]
-    jlens_logits, model_logits, _ = lens.apply(model, prompt, layers=layers, positions=[-2])
-    logit_lens, _, _ = lens.apply(model, prompt, layers=layers, positions=[-2], use_jacobian=False)
+    jlens_logits, model_logits, _ = lens.apply(model, prompt, layers=layers, positions=[position])
+    logit_lens, _, _ = lens.apply(model, prompt, layers=layers, positions=[position], use_jacobian=False)
 
     def top5(logits):
         return [tokenizer.decode([t]) for t in logits.topk(5).indices]
@@ -97,6 +100,14 @@ def apply(model_name: str, example_slug: str) -> tuple[str, str]:
         lines.append(f"L{layer:>3} logit-lens: {top5(logit_lens[layer][0])}")
         lines.append(f"L{layer:>3} J-lens:     {top5(jlens_logits[layer][0])}")
     lines.append(f"model:           {top5(model_logits[0])}")
+
+    if max_new_tokens:
+        # The template already wrote the special tokens into `prompt`, so don't let the tokenizer add more.
+        inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(hf_model.device)
+        out = hf_model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        continuation = tokenizer.decode(out[0, inputs.input_ids.shape[1] :], skip_special_tokens=False)
+        lines.append(f"continuation:    {continuation!r}")
+        prompt += continuation  # slice page below covers the generated tokens too
 
     gloss = {int(k): v for k, v in json.load(gzip.open("/root/assets/qwen_gloss.json.gz")).items()}
     slice_data = compute_slice(model, lens, prompt, layer_stride=2, mask_display=True)
@@ -117,7 +128,7 @@ def fit(model_name: str, n_prompts: int, dim_batch: int, checkpoint_every: int) 
     import jlens
     from jlens.examples import load_wikitext_prompts
 
-    model, _ = _load_model(model_name)
+    model, _, _ = _load_model(model_name)
     out_dir = Path(VOL) / "lenses" / model_name.split("/")[-1].lower()
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"jacobian_lens_n{n_prompts}.pt"
@@ -141,12 +152,14 @@ def main(
     mode: str = "apply",
     model: str = "Qwen/Qwen3.5-4B",
     example: str = "multihop",
+    position: int = -2,
+    generate: int = 0,
     n_prompts: int = 100,
     dim_batch: int = 32,
     checkpoint_every: int = 10,
 ) -> None:
     if mode == "apply":
-        text, page = apply.remote(model, example)
+        text, page = apply.remote(model, example, position, generate)
         print(text)
         Path("slice.html").write_text(page)
         print("wrote slice.html")
